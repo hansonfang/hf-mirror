@@ -100,3 +100,11 @@ Endpoint 配置保存在 `/work/.config/settings.json`，任务记录保存在 `
 |------|---------|----------|----------|
 | 整仓下载 | `gpt2` | 留空 | `/work/gpt2/` |
 | 单文件下载 | `unsloth/gemma-4-31B-it-GGUF` | `q4_k_s.gguf` | `/work/unsloth__gemma-4-31B-it-GGUF/q4_k_s.gguf` |
+
+## 常见问题
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| `401 Unauthorized` + `cas-server.xethub.hf.co` | 大文件走 XET 协议，镜像站无法鉴权 | 镜像已默认 `HF_HUB_DISABLE_XET=1`，需**重新构建/导入镜像** |
+| `308 Redirect` + `hf-mirror.com` | hub 库对 308 处理不完整 | 换 `huggingface.co` 或 `hf-cdn.sufy.com` |
+| 容器 `exit 137` / OOM | 内存不足 | 容器内存 ≥ **2GB**（大 GGUF 建议 4GB） |

@@ -32,6 +32,7 @@ export PYTHONPATH="${ROOT_DIR}"
 export HF_WORK_DIR="${ROOT_DIR}/data"
 export HF_CACHE_DIR="${ROOT_DIR}/.cache/huggingface"
 export HF_HUB_DISABLE_PROGRESS_BARS=0
+export HF_HUB_DISABLE_XET=1
 
 echo "本地调试: http://127.0.0.1:${PORT}"
 echo "输出目录: ${HF_WORK_DIR}"

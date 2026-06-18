@@ -1,5 +1,9 @@
 import logging
 import os
+
+# 须在 import huggingface_hub 之前设置；镜像站不支持 XET/CAS 鉴权
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 import threading
 import uuid
 from datetime import datetime, timezone
