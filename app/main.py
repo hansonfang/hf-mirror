@@ -1,17 +1,22 @@
 import logging
 import os
+import time
 
-# 须在 import huggingface_hub 之前设置；镜像站不支持 XET/CAS 鉴权
+# 须在 import huggingface_hub 之前设置
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+# 大文件经镜像 CDN 下载时，默认 10s 读超时过短易触发断点续传失败
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "600")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
 
 import threading
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -39,6 +44,16 @@ _storage: Storage | None = None
 _cancelled_tasks: set[str] = set()
 _cancel_lock = threading.Lock()
 
+T = TypeVar("T")
+_DOWNLOAD_RETRY_ATTEMPTS = 5
+_TRANSIENT_DOWNLOAD_ERRORS = (
+    httpx.ConnectError,
+    httpx.TimeoutException,
+    httpx.ReadTimeout,
+    httpx.RemoteProtocolError,
+    OSError,
+)
+
 
 class DownloadCancelled(Exception):
     """用户主动停止下载"""
@@ -62,6 +77,34 @@ def _clear_cancel(task_id: str) -> None:
 def _ensure_not_cancelled(task_id: str) -> None:
     if _is_cancelled(task_id):
         raise DownloadCancelled()
+
+
+def _call_with_download_retry(task_id: str, action: Callable[[], T]) -> T:
+    """网络抖动时重试整次下载调用，hub 会从缓存断点续传。"""
+    for attempt in range(1, _DOWNLOAD_RETRY_ATTEMPTS + 1):
+        try:
+            _ensure_not_cancelled(task_id)
+            return action()
+        except DownloadCancelled:
+            raise
+        except _TRANSIENT_DOWNLOAD_ERRORS as exc:
+            if attempt >= _DOWNLOAD_RETRY_ATTEMPTS:
+                raise
+            wait_s = min(30, 2**attempt)
+            logger.warning(
+                "[%s] 下载中断 (%s)，%ds 后重试 (%d/%d)",
+                task_id,
+                exc,
+                wait_s,
+                attempt,
+                _DOWNLOAD_RETRY_ATTEMPTS,
+            )
+            _set_task(
+                task_id,
+                message=f"网络中断，{wait_s}s 后重试 ({attempt}/{_DOWNLOAD_RETRY_ATTEMPTS})…",
+            )
+            time.sleep(wait_s)
+    raise RuntimeError("unreachable")
 
 
 class _QuietTasksAccessFilter(logging.Filter):
@@ -311,26 +354,32 @@ def _run_download(
     try:
         _ensure_not_cancelled(task_id)
         if filename:
-            saved = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                repo_type=repo_type.value,
-                local_dir=str(target_dir),
-                cache_dir=str(CACHE_DIR),
-                endpoint=endpoint,
-                tqdm_class=tqdm_class,
+            saved = _call_with_download_retry(
+                task_id,
+                lambda: hf_hub_download(
+                    repo_id=repo_id,
+                    filename=filename,
+                    repo_type=repo_type.value,
+                    local_dir=str(target_dir),
+                    cache_dir=str(CACHE_DIR),
+                    endpoint=endpoint,
+                    tqdm_class=tqdm_class,
+                ),
             )
             local_path = saved
             message = f"下载完成：{saved}"
         else:
-            snapshot_download(
-                repo_id=repo_id,
-                repo_type=repo_type.value,
-                local_dir=str(target_dir),
-                cache_dir=str(CACHE_DIR),
-                endpoint=endpoint,
-                tqdm_class=tqdm_class,
-                max_workers=1,
+            _call_with_download_retry(
+                task_id,
+                lambda: snapshot_download(
+                    repo_id=repo_id,
+                    repo_type=repo_type.value,
+                    local_dir=str(target_dir),
+                    cache_dir=str(CACHE_DIR),
+                    endpoint=endpoint,
+                    tqdm_class=tqdm_class,
+                    max_workers=1,
+                ),
             )
             local_path = str(target_dir)
             message = f"下载完成：{target_dir}"
