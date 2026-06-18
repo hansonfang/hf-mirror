@@ -2,14 +2,17 @@ import logging
 import os
 import time
 
-# 须在 import huggingface_hub 之前设置
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-# 大文件经镜像 CDN 下载时，默认 10s 读超时过短易触发断点续传失败
-os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "600")
-os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
+# 强制设置环境参数，确保不受宿主机/容器已有环境变量的干扰
+# 禁用 XET 以兼容第三方镜像站的 LFS HTTP 路径
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+# 读超时设为 20s（既能容忍偶发抖动，又能在连接卡死时快速触发重试和断点续传）
+os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "20"
+# ETAG 元数据获取超时设为 15s
+os.environ["HF_HUB_ETAG_TIMEOUT"] = "15"
 
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -29,6 +32,9 @@ from app.storage import Storage
 
 WORK_DIR = Path(os.environ.get("HF_WORK_DIR", "/work"))
 CACHE_DIR = Path(os.environ.get("HF_CACHE_DIR", "/root/.cache/huggingface"))
+# 后台默认并行：多任务可同时下载，整仓内多文件并行
+MAX_PARALLEL_TASKS = 8
+MAX_FILE_WORKERS = 4
 
 logger = logging.getLogger("hf-downloader")
 hf_logging.set_verbosity_info()
@@ -39,8 +45,11 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 _tasks: dict[str, dict[str, Any]] = {}
 _tasks_lock = threading.Lock()
 _progress_state: dict[str, dict[str, Any]] = {}
+_progress_locks: dict[str, threading.Lock] = {}
 _settings_lock = threading.Lock()
 _storage: Storage | None = None
+_download_executor: ThreadPoolExecutor | None = None
+_download_executor_lock = threading.Lock()
 _cancelled_tasks: set[str] = set()
 _cancel_lock = threading.Lock()
 
@@ -155,14 +164,14 @@ def _normalize_endpoint(raw: str) -> str:
 
 def get_hf_endpoint() -> str:
     assert _storage is not None
-    with _settings_lock:
-        return _storage.get_hf_endpoint()
+    return _storage.get_hf_endpoint()
 
 
 def save_hf_endpoint(raw: str) -> dict[str, Any]:
     assert _storage is not None
     endpoint = _normalize_endpoint(raw)
-    result = _storage.set_hf_endpoint(endpoint)
+    with _settings_lock:
+        result = _storage.set_hf_endpoint(endpoint)
     logger.info("HF Endpoint 已更新为 %s", endpoint)
     return result
 
@@ -229,28 +238,32 @@ def _estimate_total_bytes(
 
 def _push_progress(task_id: str) -> None:
     _ensure_not_cancelled(task_id)
-    state = _progress_state.get(task_id)
-    if not state:
+    progress_lock = _progress_locks.get(task_id)
+    if progress_lock is None:
         return
+    with progress_lock:
+        state = _progress_state.get(task_id)
+        if not state:
+            return
 
-    completed = int(state["completed_bytes"])
-    current = int(state.get("current_bytes", 0))
-    downloaded = completed + current
-    total = state.get("total_bytes")
-    current_file = state.get("current_file") or ""
+        completed = int(state["completed_bytes"])
+        active = sum(int(value) for value in state.get("active_bytes", {}).values())
+        downloaded = completed + active
+        total = state.get("total_bytes")
+        current_file = state.get("current_file") or ""
 
-    if total and total > 0:
-        progress = min(100, int(downloaded / total * 100))
-        message = (
-            f"{current_file} · {progress}% "
-            f"({_format_bytes(downloaded)} / {_format_bytes(total)})"
-        ).strip()
-    elif current_file:
-        message = f"{current_file} · {_format_bytes(downloaded)}"
-        progress = 0
-    else:
-        message = "正在下载…"
-        progress = 0
+        if total and total > 0:
+            progress = min(100, int(downloaded / total * 100))
+            message = (
+                f"{current_file} · {progress}% "
+                f"({_format_bytes(downloaded)} / {_format_bytes(total)})"
+            ).strip()
+        elif current_file:
+            message = f"{current_file} · {_format_bytes(downloaded)}"
+            progress = 0
+        else:
+            message = "正在下载…"
+            progress = 0
 
     _set_task(
         task_id,
@@ -268,24 +281,31 @@ def _bar_label(bar: Any) -> str:
 
 def _create_progress_tqdm(task_id: str) -> type:
     state = _progress_state[task_id]
+    progress_lock = _progress_locks[task_id]
     base_tqdm = hf_tqdm
+    bar_seq = {"value": 0}
 
     class TaskProgressBar(base_tqdm):
-        def _sync_progress(self) -> None:
-            # snapshot_download 通过 refresh() 累加 total，通过 update() 累加 n
-            state["current_bytes"] = int(self.n)
-            bar_total = int(self.total or 0)
-            if bar_total > 0:
-                state["total_bytes"] = bar_total
-            label = _bar_label(self)
-            if label:
-                state["current_file"] = label
-            _push_progress(task_id)
-
         def __init__(self, *args: Any, **kwargs: Any) -> None:
+            bar_seq["value"] += 1
+            self._bar_id = f"bar-{bar_seq['value']}"
             kwargs["disable"] = False
             super().__init__(*args, **kwargs)
+            with progress_lock:
+                state.setdefault("active_bytes", {})[self._bar_id] = int(self.n)
             self._sync_progress()
+
+        def _sync_progress(self) -> None:
+            with progress_lock:
+                state.setdefault("active_bytes", {})[self._bar_id] = int(self.n)
+                bar_total = int(self.total or 0)
+                if bar_total > 0:
+                    aggregate_total = int(state.get("total_bytes") or 0)
+                    state["total_bytes"] = max(aggregate_total, bar_total)
+                label = _bar_label(self)
+                if label:
+                    state["current_file"] = label
+            _push_progress(task_id)
 
         def update(self, n: float = 1) -> bool | None:
             result = super().update(n)
@@ -299,15 +319,18 @@ def _create_progress_tqdm(task_id: str) -> type:
         def set_description(self, desc: str | None = None, refresh: bool = True) -> None:
             super().set_description(desc, refresh=refresh)
             if desc:
-                state["current_file"] = str(desc)
+                with progress_lock:
+                    state["current_file"] = str(desc)
             self._sync_progress()
 
         def close(self) -> None:
             try:
                 super().close()
             finally:
-                state["completed_bytes"] = int(state["completed_bytes"]) + int(self.n)
-                state["current_bytes"] = 0
+                with progress_lock:
+                    active = state.setdefault("active_bytes", {})
+                    finished = int(active.pop(self._bar_id, self.n))
+                    state["completed_bytes"] = int(state["completed_bytes"]) + finished
                 _push_progress(task_id)
 
     return TaskProgressBar
@@ -332,9 +355,10 @@ def _run_download(
         return
 
     total_bytes = _estimate_total_bytes(repo_id, repo_type, filename, endpoint)
+    _progress_locks[task_id] = threading.Lock()
     _progress_state[task_id] = {
         "completed_bytes": 0,
-        "current_bytes": 0,
+        "active_bytes": {},
         "current_file": "",
         "total_bytes": total_bytes,
     }
@@ -378,7 +402,7 @@ def _run_download(
                     cache_dir=str(CACHE_DIR),
                     endpoint=endpoint,
                     tqdm_class=tqdm_class,
-                    max_workers=1,
+                    max_workers=MAX_FILE_WORKERS,
                 ),
             )
             local_path = str(target_dir)
@@ -423,11 +447,12 @@ def _run_download(
     finally:
         _clear_cancel(task_id)
         _progress_state.pop(task_id, None)
+        _progress_locks.pop(task_id, None)
 
 
 @app.on_event("startup")
 def _configure_logging() -> None:
-    global _storage
+    global _storage, _download_executor
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -435,7 +460,18 @@ def _configure_logging() -> None:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     _storage = Storage(WORK_DIR)
     _storage.load_tasks_into(_tasks)
-    logger.info("HF Endpoint=%s, 输出目录=%s", get_hf_endpoint(), WORK_DIR)
+    with _download_executor_lock:
+        _download_executor = ThreadPoolExecutor(
+            max_workers=MAX_PARALLEL_TASKS,
+            thread_name_prefix="hf-dl",
+        )
+    logger.info(
+        "HF Endpoint=%s, 输出目录=%s, 并行任务=%d, 文件线程=%d",
+        get_hf_endpoint(),
+        WORK_DIR,
+        MAX_PARALLEL_TASKS,
+        MAX_FILE_WORKERS,
+    )
 
 
 @app.get("/")
@@ -460,8 +496,7 @@ def read_settings() -> dict[str, Any]:
 
 @app.put("/api/settings")
 def update_settings(body: SettingsUpdate) -> dict[str, Any]:
-    with _settings_lock:
-        return save_hf_endpoint(body.hf_endpoint)
+    return save_hf_endpoint(body.hf_endpoint)
 
 
 @app.get("/api/tasks")
@@ -538,11 +573,11 @@ def start_download(body: DownloadRequest) -> dict[str, Any]:
         endpoint,
     )
 
-    thread = threading.Thread(
-        target=_run_download,
-        args=(task_id, repo_id, body.repo_type, filename, endpoint),
-        daemon=True,
-    )
-    thread.start()
+    with _download_executor_lock:
+        executor = _download_executor
+    if executor is None:
+        raise HTTPException(status_code=503, detail="下载服务未就绪")
+
+    executor.submit(_run_download, task_id, repo_id, body.repo_type, filename, endpoint)
 
     return task

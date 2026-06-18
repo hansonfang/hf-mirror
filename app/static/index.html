@@ -128,6 +128,10 @@
       align-items: center;
     }
 
+    .parallel-row {
+      display: none;
+    }
+
     button.primary {
       padding: 7px 10px;
       font-weight: 600;
@@ -160,6 +164,13 @@
       margin-bottom: 6px;
       color: var(--muted);
       font-size: 12px;
+      gap: 8px;
+    }
+
+    .tasks-head-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
 
     .tasks-list {
@@ -297,7 +308,10 @@
     <section class="panel tasks-panel">
       <div class="tasks-head">
         <span>任务</span>
-        <span id="refresh-badge">自动刷新</span>
+        <div class="tasks-head-right">
+          <span id="active-count"></span>
+          <span id="refresh-badge">自动刷新</span>
+        </div>
       </div>
       <div class="tasks-list" id="tasks"></div>
     </section>
@@ -310,6 +324,7 @@
     const submitBtn = document.getElementById("submit-btn");
     const endpointInput = document.getElementById("hf-endpoint");
     const endpointHistoryEl = document.getElementById("endpoint-history");
+    const activeCountEl = document.getElementById("active-count");
     let settingsSaveTimer = null;
     let lastSavedEndpoint = "";
     let endpointHistory = [];
@@ -321,6 +336,11 @@
       failed: "失败",
       cancelled: "已停",
     };
+
+    function updateActiveCount(items) {
+      const active = items.filter((task) => task.status === "pending" || task.status === "running").length;
+      activeCountEl.textContent = active > 0 ? `${active} 进行中` : "";
+    }
 
     function formatBytes(num) {
       if (num === null || num === undefined) return "—";
@@ -375,6 +395,7 @@
     }
 
     function renderTasks(items) {
+      updateActiveCount(items);
       if (!items.length) {
         tasksEl.innerHTML = '<div class="empty">暂无任务</div>';
         return;
@@ -504,7 +525,6 @@
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      submitBtn.disabled = true;
 
       const payload = {
         repo_id: form.repo_id.value.trim(),
@@ -527,8 +547,6 @@
         await loadTasks();
       } catch (error) {
         alert("请求失败：" + error.message);
-      } finally {
-        submitBtn.disabled = false;
       }
     });
 
