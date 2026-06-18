@@ -108,4 +108,5 @@ Endpoint 配置保存在 `/work/.config/settings.json`，任务记录保存在 `
 | `401 Unauthorized` + `cas-server.xethub.hf.co` | 大文件走 XET 协议，镜像站无法鉴权 | 镜像已默认 `HF_HUB_DISABLE_XET=1`，需**重新构建/导入镜像** |
 | `308 Redirect` + `hf-mirror.com` | hub 库对 308 处理不完整 | 换 `huggingface.co` 或 `hf-cdn.sufy.com` |
 | 容器 `exit 137` / OOM | 内存不足 | 容器内存 ≥ **2GB**（大 GGUF 建议 4GB） |
-| 下载中途 timeout / SSL EOF / 突然卡死 | 镜像 CDN 慢或连接静默中断。若读超时设得太大，连接卡死会一直卡住。 | 已将 `HF_HUB_DOWNLOAD_TIMEOUT` 缩短为 `20` 秒并引入了自动重退机制。连接卡死 20 秒后会立即断开并自动触发断点续传。 |
+| 下载中途 timeout / SSL EOF / 突然卡死 | 镜像 CDN 慢或连接静默中断 | 已默认 `HF_HUB_DOWNLOAD_TIMEOUT=60` 并自动重试；仍失败可换 endpoint 或重点下载 |
+| 进度 100% 但一直「下载中」 | 字节已传完，hub 仍在 cas-bridge 续传/校验；或同时下多个大 GGUF 争抢带宽 | 页面会显示「续传/校验中」；大文件建议**一次只下一个**；可换 `huggingface.co` endpoint |

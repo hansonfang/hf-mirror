@@ -381,11 +381,14 @@
       }
 
       const hasTotal = task.total_bytes && task.total_bytes > 0;
-      const pct = hasTotal ? Math.min(100, task.progress || 0) : null;
+      const rawPct = hasTotal ? Math.min(100, task.progress || 0) : null;
+      const pct = hasTotal ? (task.status === "running" ? Math.min(99, rawPct) : rawPct) : null;
       const bar = hasTotal
         ? `<div class="progress-bar" style="width:${pct}%"></div>`
         : `<div class="progress-bar indeterminate"></div>`;
-      const left = hasTotal ? `${pct}%` : (task.downloaded_bytes > 0 ? "…" : "准备");
+      const left = hasTotal
+        ? (task.status === "running" && rawPct >= 99 ? "校验" : `${pct}%`)
+        : (task.downloaded_bytes > 0 ? "…" : "准备");
 
       return `
         <div class="progress-wrap">

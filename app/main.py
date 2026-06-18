@@ -5,8 +5,8 @@ import time
 # 强制设置环境参数，确保不受宿主机/容器已有环境变量的干扰
 # 禁用 XET 以兼容第三方镜像站的 LFS HTTP 路径
 os.environ["HF_HUB_DISABLE_XET"] = "1"
-# 读超时设为 20s（既能容忍偶发抖动，又能在连接卡死时快速触发重试和断点续传）
-os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "20"
+# 读超时：大文件经镜像 CDN/cas-bridge 时 20s 过短会频繁触发 hub 内部续传，进度条先到 100% 但任务仍未完成
+os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "60"
 # ETAG 元数据获取超时设为 15s
 os.environ["HF_HUB_ETAG_TIMEOUT"] = "15"
 
@@ -253,11 +253,20 @@ def _push_progress(task_id: str) -> None:
         current_file = state.get("current_file") or ""
 
         if total and total > 0:
-            progress = min(100, int(downloaded / total * 100))
-            message = (
-                f"{current_file} · {progress}% "
-                f"({_format_bytes(downloaded)} / {_format_bytes(total)})"
-            ).strip()
+            raw_progress = min(100, int(downloaded / total * 100))
+            # hub 内部续传时 tqdm 可能已到 100%，但文件校验/收尾尚未完成
+            if raw_progress >= 100 or downloaded >= total:
+                progress = 99
+                message = (
+                    f"{current_file} · 续传/校验中 "
+                    f"({_format_bytes(downloaded)} / {_format_bytes(total)})"
+                ).strip()
+            else:
+                progress = raw_progress
+                message = (
+                    f"{current_file} · {progress}% "
+                    f"({_format_bytes(downloaded)} / {_format_bytes(total)})"
+                ).strip()
         elif current_file:
             message = f"{current_file} · {_format_bytes(downloaded)}"
             progress = 0
